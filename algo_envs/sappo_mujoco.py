@@ -16,7 +16,7 @@ import yaml
 import torch.utils.tensorboard as tensorboard
 
 parser = argparse.ArgumentParser("SAPPO Mujoco Training")
-parser.add_argument("--env_name",type=str,default="Walker2d")
+parser.add_argument("--env_name",type=str,default="Hopper")
 parser.add_argument("--gae_lambda",type=float,default=0.95)
 parser.add_argument("--gamma",type=float,default=0.99)
 parser.add_argument("--clip_coef",type=float,default=0.2)
@@ -41,8 +41,9 @@ parser.add_argument("--num_envs",type=int,default=32)
 parser.add_argument("--num_steps",type=int,default=512)
 parser.add_argument("--use_gpu",type=bool,default=False)
 parser.add_argument("--mini_batch_size",type=int,default=128)
-parser.add_argument("--adpr_coef",type=float,default=1e-3)
+parser.add_argument("--adpr_coef",type=float,default=1)
 parser.add_argument("--attacker_noise_limit",type=float,default=0.05)
+parser.add_argument("--eps_steps",type=int,default=10)
 
 args = parser.parse_args()
 
@@ -384,9 +385,11 @@ class PPOMujocoCalculate(AlgoBase.AlgoBaseCalculate):
             mini_advantage = advantage_list[start_index:end_index]
             mini_returns = returns_list[start_index:end_index]
 
-            adpr = self.state_adversarial_policy_regularizer()
+            batch_action_means = self.calculate_net.mu(mini_states)
 
-            loss_adpr = -adpr*adpr_coef
+            adpr = getstate_kl_bound_sgld(self.calculate_net, mini_states, batch_action_means, args.attacker_noise_limit, args.eps_steps, torch.exp(self.calculate_net.log_std))
+
+            loss_adpr = adpr.mean()*adpr_coef
 
             ratio1 = torch.exp(mini_new_log_probs-mini_old_log_probs)
 
@@ -472,7 +475,7 @@ class PPOMujocoCalculate(AlgoBase.AlgoBaseCalculate):
         else:
             return args.ratio_coef
 
-    def state_adversarial_policy_regularizer(self):
+    """def state_adversarial_policy_regularizer(self):
         R_ppo_theta = 0
         s_i = self.states_list
         with torch.no_grad():
@@ -481,7 +484,7 @@ class PPOMujocoCalculate(AlgoBase.AlgoBaseCalculate):
         pi_s_i_perturbeds = self.calculate_net.get_distris(s_i_perturbeds)
         kl_divergence = KL_divergence(pi_s_i, pi_s_i_perturbeds)
         R_ppo_theta = kl_divergence.mean()
-        return R_ppo_theta
+        return R_ppo_theta"""
 
 @torch.no_grad()
 def B_p(state, epsilon_t):
@@ -501,6 +504,37 @@ def B_p(state, epsilon_t):
 
 def KL_divergence(p, q):
     return torch.distributions.kl.kl_divergence(p, q)
+
+def getstate_kl_bound_sgld(net, batch_states, batch_action_means, eps, steps, stdev):
+    warpped_net = net
+    batch_action_means = batch_action_means.detach()
+    # upper and lower bounds for clipping
+    states_ub = batch_states + eps
+    states_lb = batch_states - eps
+    step_eps = eps / steps
+    # SGLD noise factor. We set (inverse) beta=1e-5 as gradients are relatively small here.
+    beta = 1e-5
+    noise_factor = np.sqrt(2 * step_eps * beta)
+    noise = torch.randn_like(batch_states) * noise_factor
+    var_states = (batch_states.clone() + noise.sign() * step_eps).detach().requires_grad_()
+    for i in range(steps):
+        # Find a nearby state new_phi that maximize the difference
+        diff = (warpped_net.mu(var_states) - batch_action_means) / stdev
+        kl = (diff * diff).sum(axis=-1, keepdim=True).mean()
+        # Need to clear gradients before the backward() for policy_loss
+        kl.backward(retain_graph=True)
+        # Reduce noise at every step.
+        noise_factor = np.sqrt(2 * step_eps * beta) / (i+2)
+        # Project noisy gradient to step boundary.
+        update = (var_states.grad + noise_factor * torch.randn_like(var_states)).sign() * step_eps
+        var_states.data += update
+        # clip into the upper and lower bounds
+        var_states = torch.max(var_states, states_lb)
+        var_states = torch.min(var_states, states_ub)
+        var_states = var_states.detach().requires_grad_()
+    net.zero_grad()
+    diff = (warpped_net.get_sample_data(var_states.requires_grad_(False))[0] - batch_action_means) / stdev
+    return (diff * diff).sum(axis=-1, keepdim=True)
         
 if __name__ == "__main__":
     comment = "SAPPO Mujoco Training"
@@ -549,11 +583,10 @@ if __name__ == "__main__":
         infos = check_agent.check_env()
         for k,v in infos.items():
             writer.add_scalar(k,v,config_dict[0])
-        
-        if (iteration+1) % 100 == 0:
-            # Saving model
-            torch.save(train_net, "saved_model/sappo_mujoco_"+str(config_dict[0])+".pt")
-            # Saving model dict
-            torch.save(train_net.state_dict(), "saved_model/sappo_mujoco_"+str(config_dict[0])+".pth")
-            
+         
         print("version:",config_dict[0],"sum_rewards:",infos['sum_rewards'])
+
+    # Saving model
+    torch.save(train_net, "saved_model/sappo_mujoco_"+parser.env_name+".pkl")
+    # Saving model dict
+    torch.save(train_net.state_dict(), "saved_model/sappo_mujoco_"+parser.env_name+".pth")

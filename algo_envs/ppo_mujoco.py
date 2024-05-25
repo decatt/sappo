@@ -11,10 +11,11 @@ from types import SimpleNamespace
 import algo_envs.algo_base as AlgoBase
 import argparse
 import yaml
+from algo_envs.nets import PPOMujocoNet
 
 
 parser = argparse.ArgumentParser("PPO Mujoco Normal Share GAE")
-parser.add_argument("--env_name",type=str,default="Swimmer")
+parser.add_argument("--env_name",type=str,default="BipedalWalker")
 parser.add_argument("--gae_lambda",type=float,default=0.95)
 parser.add_argument("--gamma",type=float,default=0.99)
 parser.add_argument("--clip_coef",type=float,default=0.2)
@@ -26,7 +27,7 @@ parser.add_argument("--use_noise",type=bool,default=True)
 parser.add_argument("--learning_rate",type=float,default=2.5e-4)
 parser.add_argument("--ratio_coef",type=float,default=0.5)
 parser.add_argument("--grad_norm",type=float,default=0.5)
-parser.add_argument("--pg_loss_type",type=int,default=2)
+parser.add_argument("--pg_loss_type",type=int,default=1)
 parser.add_argument("--enable_clip_max",type=bool,default=True)
 parser.add_argument("--enable_ratio_decay",type=bool,default=False)
 parser.add_argument("--enable_entropy_decay",type=bool,default=False)
@@ -41,7 +42,8 @@ parser.add_argument("--use_gpu",type=bool,default=False)
 parser.add_argument("--mini_batch_size",type=int,default=128)
 args = parser.parse_args()
 
-path = 'algo_envs\configs\ppo_mujoco.yaml'
+#path = 'algo_envs\configs\ppo_mujoco.yaml'
+path = None
 if path is not None:
     #read yaml file fot hyperparameters
     with open(path, 'r') as f:
@@ -57,96 +59,12 @@ train_envs = {
     'Pusher':SimpleNamespace(**{'env_name': "Pusher-v4",'obs_dim':23,'act_dim':7,'hide_dim':64}),
     'Humanoid':SimpleNamespace(**{'env_name': "Humanoid-v4",'obs_dim':376,'act_dim':17,'hide_dim':512}),
     'Walker2d':SimpleNamespace(**{'env_name': "Walker2d-v4",'obs_dim':17,'act_dim':6,'hide_dim':64}),
+    'BipedalWalker':SimpleNamespace(**{'env_name': "BipedalWalker-v3",'obs_dim':24,'act_dim':4,'hide_dim':64}),
 }
 
 # current environment name
 current_env_name = args.env_name
 
-
-class PPOMujocoNet(AlgoBase.AlgoBaseNet):
-    def __init__(self):
-        super(PPOMujocoNet,self).__init__()
-        
-        obs_dim = train_envs[current_env_name].obs_dim
-        act_dim = train_envs[current_env_name].act_dim
-        hide_dim = train_envs[current_env_name].hide_dim
-        
-        if args.use_noise:
-            self.noise_layer_out = AlgoBase.NoisyLinear(hide_dim,act_dim)
-            self.noise_layer_hide = AlgoBase.NoisyLinear(hide_dim,hide_dim)
-                            
-            #normal mu
-            self.mu = nn.Sequential(
-                    AlgoBase.layer_init(nn.Linear(obs_dim, hide_dim)),
-                    nn.ReLU(),
-                    AlgoBase.layer_init(nn.Linear(hide_dim, hide_dim)),
-                    nn.ReLU(),
-                    self.noise_layer_hide,
-                    nn.ReLU(),
-                    self.noise_layer_out,
-                    nn.Tanh()
-                )
-        else:
-            #normal mu
-            self.mu = nn.Sequential(
-                    AlgoBase.layer_init(nn.Linear(obs_dim, hide_dim)),
-                    nn.ReLU(),
-                    AlgoBase.layer_init(nn.Linear(hide_dim, hide_dim)),
-                    nn.ReLU(),
-                    AlgoBase.layer_init(nn.Linear(hide_dim, hide_dim)),
-                    nn.ReLU(),
-                    AlgoBase.layer_init(nn.Linear(hide_dim, act_dim)),
-                    nn.Tanh()
-                )
-                
-        log_std = -0.5 * np.ones(act_dim, dtype=np.float32)
-        self.log_std = nn.Parameter(torch.as_tensor(log_std))
-        
-        self.value = nn.Sequential(
-                AlgoBase.layer_init(nn.Linear(obs_dim, hide_dim)),
-                nn.ReLU(),
-                AlgoBase.layer_init(nn.Linear(hide_dim, hide_dim)),
-                nn.ReLU(),
-                AlgoBase.layer_init(nn.Linear(hide_dim, 1))
-            )
-                
-    def get_distris(self,states):
-        mus = self.mu(states)
-        distris = Normal(mus,torch.exp(self.log_std))
-        return distris
-
-    def get_value(self,states):
-        return self.value(states)
-        
-    def forward(self,states,actions):
-        values = self.value(states)
-        distris = self.get_distris(states)
-        log_probs = distris.log_prob(actions) 
-        return values,log_probs,distris.entropy()
-    
-    def get_sample_data(self,states):
-        distris = self.get_distris(states)
-        actions = distris.sample()
-        log_probs = distris.log_prob(actions)
-        return actions,log_probs
-    
-    def get_check_data(self,states):
-        distris = self.get_distris(states)
-        mus = self.mu(states)
-        log_probs = distris.log_prob(distris.mean)
-        return mus,distris.entropy(),log_probs
-    
-    def get_calculate_data(self,states,actions):
-        values = self.value(states)
-        distris = self.get_distris(states)
-        log_probs = distris.log_prob(actions) 
-        return values,log_probs,distris.entropy()
-    
-    def sample_noise(self):
-        if args.use_noise:
-            self.noise_layer_out.sample_noise()
-            self.noise_layer_hide.sample_noise()
-    
 class PPOMujocoUtils(AlgoBase.AlgoBaseUtils):
     pass
                     
@@ -163,8 +81,8 @@ class PPOMujocoAgent(AlgoBase.AlgoBaseAgent):
         env_name = train_envs[current_env_name].env_name
     
         if not is_checker:
-            self.envs = [gym.make(env_name) for _ in range(self.num_envs)]
-            self.states = [self.envs[i].reset()[0] for i in range(self.num_envs)]
+            self.envs = gym.vector.SyncVectorEnv([lambda:gym.make(env_name) for _ in range(self.num_envs)])
+            self.states,_ = self.envs.reset()
             self.exps_list = [[] for _ in range(self.num_envs)]
         else:
             print("PPOMujocoNormalShare check mujoco env is",env_name)
@@ -176,14 +94,16 @@ class PPOMujocoAgent(AlgoBase.AlgoBaseAgent):
         while len(self.exps_list[0]) < self.num_steps:
             
             actions,log_probs = self.get_sample_actions(self.states)
+            next_states_n, rewards_n, dones_n, _, _ = self.envs.step(actions)
             for i in range(self.num_envs):
-                next_state_n, reward_n, done_n, _, _ = self.envs[i].step(actions[i])                
+                next_state_n = next_states_n[i]
+                reward_n = rewards_n[i]
+                done_n = dones_n[i]
                 if done_n or len(self.exps_list[i]) >= self.num_steps:
-                    next_state_n,_ = self.envs[i].reset()
                     done_n = True
                     
                 self.exps_list[i].append([self.states[i],actions[i],reward_n,done_n,log_probs[i],self.model_dict['train_version']])
-                self.states[i] = next_state_n
+            self.states = next_states_n
         # Starting training
         train_exps = self.exps_list
         # Deleting the length before self.pae_length
@@ -205,7 +125,7 @@ class PPOMujocoAgent(AlgoBase.AlgoBaseAgent):
             mu,entropy,log_prob = self.get_check_action(self.states)
             next_state_n, reward_n, is_done, _, _ = self.envs.step(mu)
             if is_done:
-                next_state_n = self.envs.reset()
+                next_state_n,_ = self.envs.reset()
             self.states = next_state_n
             rewards.append(reward_n)
             mus.append(mu)
@@ -254,7 +174,7 @@ class PPOMujocoCalculate(AlgoBase.AlgoBaseCalculate):
         else:
             self.device = torch.device('cpu')
                         
-        self.calculate_net = PPOMujocoNet()
+        self.calculate_net = PPOMujocoNet(train_envs[current_env_name].obs_dim,train_envs[current_env_name].act_dim,train_envs[current_env_name].hide_dim,args.use_noise)
         self.calculate_net.to(self.device)
         #self.calculate_net.load_state_dict(self.share_model.state_dict())
     
@@ -488,7 +408,7 @@ class PPOMujocoCalculate(AlgoBase.AlgoBaseCalculate):
         
 if __name__ == "__main__":
     # initialize training network
-    train_net = PPOMujocoNet()
+    train_net = PPOMujocoNet(train_envs[current_env_name].obs_dim,train_envs[current_env_name].act_dim,train_envs[current_env_name].hide_dim,args.use_noise)
     model_dict = {}
     model_dict[0] = 0
     model_dict['num_trainer'] = 1
@@ -501,7 +421,7 @@ if __name__ == "__main__":
     calculate = PPOMujocoCalculate(train_net,model_dict,0)
 
     # hyperparameters
-    MAX_VERSION = 5000
+    MAX_VERSION = 1000
     REPEAT_TIMES = 10
 
 
@@ -530,5 +450,7 @@ if __name__ == "__main__":
         
         # Evaluating agent
         infos = check_agent.check_env()
-            
-        print("version:",model_dict[0],"sum_rewards:",infos['sum_rewards'])
+        sum_rewards = infos['sum_rewards']
+        print("version:",model_dict[0],"sum_rewards:",sum_rewards)
+
+    torch.save(train_net.state_dict(), 'ppo_mujoco_'+current_env_name+'.pth')

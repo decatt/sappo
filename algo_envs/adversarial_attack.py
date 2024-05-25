@@ -286,6 +286,18 @@ class AttackerTraning:
             
         return np.array(np_advantages), np.array(np_returns)
     
+    def calculate_samples_Q(self):
+        current_Q = []
+        next_Q = []
+        # Q(s,a) = r + gamma * V(s')
+        for states,rewards,dones in zip(self.states,self.rewards,self.dones):
+            with torch.no_grad():
+                values = self.calculate_net.get_q_value(states)
+                next_values = self.calculate_net.get_q_value(states)
+                
+            current_Q.extend(values.cpu().numpy().reshape(-1))
+            next_Q.extend(next_values.cpu().numpy().reshape(-1))
+    
     def get_pg_loss(self,ratio,advantage):
         clip_coef = args.clip_coef
         max_clip_coef = args.max_clip_coef
@@ -383,12 +395,19 @@ if __name__ == "__main__":
     else:
         print("Can't find agent model from",model_path)
 
+    for param in ppo_agent_net.parameters():
+        param.requires_grad = False
+
     sample_agent = AttackAgent(ppo_agent_net, attacker_net, config_dict)
     check_agent = AttackAgent(ppo_agent_net, attacker_net, config_dict, True)
     trainer = AttackerTraning(attacker_net, ppo_agent_net, config_dict, 0)
 
     MAX_VERSION = 3000
     REPEAT_TIMES = 10
+
+    for check_time in range(100):
+        infos = check_agent.check_env()
+        print("check_time:",check_time,"sum_rewards:",infos['sum_rewards'])
 
     for _ in range(MAX_VERSION):
         # Sampling training data and calculating time cost
